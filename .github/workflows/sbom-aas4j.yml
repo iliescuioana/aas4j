@@ -1,0 +1,79 @@
+# SBOMs for: aas4j
+# Generated with the help of the Eclipse CSI sbom plugin (https://github.com/eclipse-csi/skills).
+# The SBOMs are uploaded to the Eclipse Foundation SBOM Registry (https://sbom.eclipse.org).
+# To view or download them, see https://csi.eclipse.dev/security-handbook/sbom/registry.html
+name: sbom-aas4j
+
+env:
+  CYCLONEDX_SPEC_VERSION: "1.6"               # CycloneDX version of the generated SBOMs
+  CYCLONEDX_MAVEN_PLUGIN_VERSION: "2.9.3"     # org.cyclonedx:cyclonedx-maven-plugin, pinned exactly
+  MAVEN_HELP_PLUGIN_VERSION: "3.5.2"          # org.apache.maven.plugins:maven-help-plugin, pinned exactly
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:          # regenerate for an older release, or for the commit that was actually deployed
+    inputs:
+      ref:
+        description: "Tag or commit to build the SBOM from (the commit Maven Central received)"
+        required: true
+        type: string
+      version:
+        description: "Release version to upload the SBOM under, e.g. 3.0.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read              # elevate per job only where a job genuinely needs more
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write         # the OIDC token PIA authenticates the upload with
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Determine product version
+        id: version
+        env:
+          VERSION: ${{ inputs.version || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._+/-]{0,127}$ ]] || { echo "::error::unexpected version: $VERSION"; exit 1; }
+          pom_version=$(mvn --batch-mode --quiet -DforceStdout \
+            "org.apache.maven.plugins:maven-help-plugin:${MAVEN_HELP_PLUGIN_VERSION}:evaluate" \
+            -Dexpression=project.version)
+          if [[ "$pom_version" != "$VERSION" ]]; then
+            echo "::warning::pom.xml at this ref is $pom_version, not $VERSION. The SBOM may not describe what was deployed; re-run this workflow by hand with the deployed commit as ref."
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          # package first, so the reactor's own modules resolve from this build, never from a registry
+          mvn --batch-mode --no-transfer-progress -DskipTests package \
+            "org.cyclonedx:cyclonedx-maven-plugin:${CYCLONEDX_MAVEN_PLUGIN_VERSION}:makeAggregateBom" \
+            -DschemaVersion="$CYCLONEDX_SPEC_VERSION" \
+            -DoutputFormat=json \
+            -DoutputName=bom
+          cp target/bom.json sbom.cdx.json
+
+      # Fails until the Eclipse Foundation authorizes uploads from this repository.
+      - name: Upload SBOM to sbom.eclipse.org
+        uses: eclipse-csi/workflows/upload-sbom@d2d3dbbc0a1907f41892c1698b3c6353235c87cb # main (2026-11-18)
+        with:
+          sbom-file: sbom.cdx.json
+          product-name: aas4j
+          product-version: ${{ steps.version.outputs.version }}
+          staging: True
